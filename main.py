@@ -243,14 +243,6 @@ class ContractDocumentPipeline:
             doc = Document(file_path)
             lines = [p.text for p in doc.paragraphs if p.text.strip()]
             return "\n".join(lines) if lines else None
-        if ext == ".pdf":
-            try:
-                with pdfplumber.open(file_path) as pdf:
-                    pages = [pg.extract_text() for pg in pdf.pages if pg.extract_text()]
-                    if pages:
-                        return "\n".join(pages)
-            except Exception:
-                pass
         return None
 
     def _ocr_image(self, img: Image.Image, page_idx: int) -> List[OCRBlock]:
