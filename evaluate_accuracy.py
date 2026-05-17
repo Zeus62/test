@@ -1,6 +1,7 @@
 import os
 import json
 import jiwer
+import re
 from main import process_contract
 
 # Point this to wherever your dataset and JSON live
@@ -43,15 +44,68 @@ def main():
             # Run your actual OCR pipeline
             ocr_output = process_contract(file_path, return_structured=False)
             
-            # Jiwer crashes if strings are totally empty
-            if not ocr_output.strip():
-                ocr_output = "EMPTY_OUTPUT"
-            if not ground_truth.strip():
-                ground_truth = "EMPTY_GROUND_TRUTH"
+            # ---------------------------------------------------------
+            # CLEANUP: Arabic Normalization & Noise Removal
+            # ---------------------------------------------------------
+            def normalize_arabic(text):
+                # 1. Catch ALL dot variations (standard dots, underscores, and ellipses)
+                text = re.sub(r'[\.\-_…]{2,}', ' ', text)
+                # 2. Remove bullet points and asterisks
+                text = re.sub(r'[•*\-]', ' ', text)
+                # 3. Remove Arabic tatweel (elongation)
+                text = re.sub(r'ـ', '', text)
+                
+                # 4. Strip Arabic Diacritics (Tashkeel - Fatha, Kasra, Damma, Tanween)
+                tashkeel = re.compile(r'[\u0617-\u061A\u064B-\u0652]')
+                text = re.sub(tashkeel, '', text)
+                
+                # 5. Unify Alef (Convert أ, إ, آ to simple ا)
+                text = re.sub(r'[أإآ]', 'ا', text)
+                
+                # 6. Unify Ta Marbuta and Ha (Convert ة to ه)
+                text = re.sub(r'ة', 'ه', text)
+                
+                # 7. Unify Ya and Alif Maksura (Convert ى to ي)
+                text = re.sub(r'ى', 'ي', text)
+                
+                # 8. Standardize messy punctuation
+                text = re.sub(r'([:،/()\[\]])', r' \1 ', text)
+                
+                # 9. Collapse all newlines and multiple spaces into a single space
+                text = re.sub(r'\s+', ' ', text)
+                
+                return text.strip()
 
-            # Calculate Error Rates
-            cer = jiwer.cer(ground_truth, ocr_output)
-            wer = jiwer.wer(ground_truth, ocr_output)
+            # Apply the aggressive normalizer to BOTH the output and the ground truth
+            ocr_output_clean = normalize_arabic(ocr_output)
+            ground_truth_clean = normalize_arabic(ground_truth)
+            
+            if not ocr_output_clean: ocr_output_clean = "EMPTY_OUTPUT"
+            if not ground_truth_clean: ground_truth_clean = "EMPTY_GROUND_TRUTH"
+
+            # ========================================================
+            # DEBUG PRINT: Let's see exactly what Jiwer is comparing
+            # ========================================================
+            print("\n--- GROUND TRUTH ---")
+            print(ground_truth_clean[:500]) # Print first 500 chars to avoid terminal spam
+            print("\n--- OCR OUTPUT ---")
+            print(ocr_output_clean[:500])
+            print("--------------------\n")
+
+            # Calculate Error Rates on the cleaned text
+            cer = jiwer.cer(ground_truth_clean, ocr_output_clean)
+            wer = jiwer.wer(ground_truth_clean, ocr_output_clean)
+
+            # Apply the aggressive normalizer to BOTH the output and the ground truth
+            ocr_output_clean = normalize_arabic(ocr_output)
+            ground_truth_clean = normalize_arabic(ground_truth)
+            
+            if not ocr_output_clean: ocr_output_clean = "EMPTY_OUTPUT"
+            if not ground_truth_clean: ground_truth_clean = "EMPTY_GROUND_TRUTH"
+
+            # Calculate Error Rates on the cleaned text
+            cer = jiwer.cer(ground_truth_clean, ocr_output_clean)
+            wer = jiwer.wer(ground_truth_clean, ocr_output_clean)
             
             total_cer += cer
             total_wer += wer

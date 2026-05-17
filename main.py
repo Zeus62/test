@@ -1,10 +1,28 @@
 import os
+
+# =====================================================================
+# HARDWARE & MEMORY CONFIGURATION (Must be set before any imports)
+# =====================================================================
+
+# OPTION 1: CPU Fallback (Uncomment to bypass a locked GPU entirely)
+# os.environ["TORCH_DEVICE"] = "cpu"
+
+# OPTION 2: GPU Diet (Keep these active to use GPU safely without OOM errors)
+os.environ["RECOGNITION_BATCH_SIZE"] = "8"   # Lowers VRAM from ~20GB to ~2GB
+os.environ["DETECTOR_BATCH_SIZE"] = "2"      # Lowers VRAM from ~9GB to ~1GB
+
+# Prevent PyTorch from heavily fragmenting memory
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+# =====================================================================
+
+import gc
 import logging
 from dataclasses import dataclass
 from typing import List, Tuple, Optional, Union
 import numpy as np
 import cv2
 from PIL import Image
+import torch
 from langdetect import detect, LangDetectException
 from docx import Document
 import pdfplumber
@@ -63,7 +81,6 @@ class ImageQualityAnalyzer:
         contrast_score = float(np.clip(np.std(gray) / 80.0, 0.0, 1.0))
         resolution_score = float(np.clip((h * w) / (1200.0 * 1200.0), 0.0, 1.0))
 
-        # Heuristic determination of document context
         if blur_score < 0.35 or resolution_score < 0.4:
             doc_type = "printed_lq"
         elif contrast_score < 0.4:
@@ -72,10 +89,8 @@ class ImageQualityAnalyzer:
             doc_type = "printed_hq"
 
         return QualityMetrics(
-            blur_score=blur_score,
-            noise_score=noise_score,
-            contrast_score=contrast_score,
-            resolution_score=resolution_score,
+            blur_score=blur_score, noise_score=noise_score,
+            contrast_score=contrast_score, resolution_score=resolution_score,
             doc_type=doc_type
         )
 
@@ -132,17 +147,29 @@ class Preprocessors:
     @classmethod
     def low_quality(cls, img: Image.Image) -> Image.Image:
         bgr = cls._pil_to_bgr(img)
-        bgr = cls._upscale(bgr, min_dim=1800)
-        bgr = cv2.fastNlMeansDenoisingColored(bgr, None, h=7, hColor=7, templateWindowSize=7, searchWindowSize=21)
-        return cls._np_to_pil(bgr)
+        gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
+        
+        # Morphological Top-Hat to sharpen thin Arabic text against blurry backgrounds
+        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (15, 15))
+        tophat = cv2.morphologyEx(gray, cv2.MORPH_BLACKHAT, kernel)
+        darkened = cv2.subtract(gray, tophat)
+        _, crisp = cv2.threshold(darkened, 0, 255, cv2.THRESH_TRUNC + cv2.THRESH_OTSU)
+        
+        return Image.fromarray(cv2.cvtColor(crisp, cv2.COLOR_GRAY2RGB))
 
     @classmethod
     def handwriting(cls, img: Image.Image) -> Image.Image:
         bgr = cls._pil_to_bgr(img)
         bgr = cls._upscale(bgr, min_dim=1500)
-        gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
-        thresh = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 11, 2)
-        return Image.fromarray(thresh)
+        lab = cv2.cvtColor(bgr, cv2.COLOR_BGR2LAB)
+        l, a, b = cv2.split(lab)
+        
+        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+        cl = clahe.apply(l)
+        
+        limg = cv2.merge((cl, a, b))
+        enhanced_bgr = cv2.cvtColor(limg, cv2.COLOR_LAB2BGR)
+        return cls._np_to_pil(enhanced_bgr)
 
     @classmethod
     def deskew(cls, img: Image.Image) -> Optional[Image.Image]:
@@ -150,23 +177,19 @@ class Preprocessors:
         gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
         edges = cv2.Canny(gray, 50, 150, apertureSize=3)
         lines = cv2.HoughLinesP(edges, 1, np.pi / 180, 100, minLineLength=100, maxLineGap=10)
-        if lines is None:
-            return None
+        if lines is None: return None
         
         angles = []
         for line in lines:
             x1, y1, x2, y2 = line[0]
-            if x2 != x1:
-                angles.append(np.degrees(np.arctan2(y2 - y1, x2 - x1)))
-        if not angles:
-            return None
+            if x2 != x1: angles.append(np.degrees(np.arctan2(y2 - y1, x2 - x1)))
+        if not angles: return None
 
         median_angle = float(np.median(angles))
         snapped = round(median_angle / 90) * 90
         skew = median_angle - snapped
 
-        if abs(skew) < 0.5:
-            return None 
+        if abs(skew) < 0.5: return None 
 
         h, w = bgr.shape[:2]
         M = cv2.getRotationMatrix2D((w / 2, h / 2), skew, 1.0)
@@ -176,44 +199,36 @@ class Preprocessors:
 
     @classmethod
     def get_candidates(cls, img: Image.Image, metrics: QualityMetrics) -> List[Tuple[str, Image.Image]]:
-        candidates: List[Tuple[str, Image.Image]] = [
-            ("original", cls.original(img)),
-        ]
+        candidates = [("original", cls.original(img))]
         deskewed = cls.deskew(img)
-        if deskewed:
-            candidates.append(("deskewed", deskewed))
+        if deskewed: candidates.append(("deskewed", deskewed))
 
         if metrics.doc_type == "printed_hq":
             candidates.append(("gentle", cls.gentle(img)))
         elif metrics.doc_type == "printed_lq":
-            candidates.append(("gentle", cls.gentle(img)))
-            candidates.append(("printed_std", cls.printed_std(img)))
-            candidates.append(("low_quality", cls.low_quality(img)))
+            candidates.extend([("gentle", cls.gentle(img)), ("printed_std", cls.printed_std(img)), ("low_quality", cls.low_quality(img))])
         elif metrics.doc_type == "handwritten":
-            candidates.append(("gentle", cls.gentle(img)))
-            candidates.append(("handwriting", cls.handwriting(img)))
+            candidates.extend([("gentle", cls.gentle(img)), ("handwriting", cls.handwriting(img))])
         else: 
-            candidates.append(("gentle", cls.gentle(img)))
-            candidates.append(("printed_std", cls.printed_std(img)))
-            candidates.append(("low_quality", cls.low_quality(img)))
+            candidates.extend([("gentle", cls.gentle(img)), ("printed_std", cls.printed_std(img)), ("low_quality", cls.low_quality(img))])
         return candidates
 
 
 class OCRScorer:
     @staticmethod
     def score(blocks: List[OCRBlock]) -> float:
-        if not blocks:
-            return 0.0
+        if not blocks: return 0.0
         confidences = [b.confidence for b in blocks]
-        return float(np.mean(confidences))
+        mean_conf = float(np.mean(confidences))
+        total_chars = sum(len(b.text.strip()) for b in blocks)
+        if total_chars == 0: return 0.0
+        return mean_conf * np.log1p(total_chars)
 
 
 class ContractDocumentPipeline:
     def __init__(self, min_confidence: float = 0.30, dpi: int = 300):
-        logger.info("Loading Surya OCR models (one-time initialization)...")
+        logger.info(f"Loading Surya OCR models on device: {os.environ.get('TORCH_DEVICE', 'cuda')}...")
         self.detection = DetectionPredictor()
-        
-        # Safe initialization of foundation engine
         try:
             from surya.foundation import FoundationPredictor
             self.foundation = FoundationPredictor()
@@ -229,12 +244,9 @@ class ContractDocumentPipeline:
 
     @staticmethod
     def _detect_lang(text: str) -> str:
-        if len(text.strip()) < 3:
-            return "short"
-        try:
-            return detect(text.strip())
-        except LangDetectException:
-            return "unknown"
+        if len(text.strip()) < 3: return "short"
+        try: return detect(text.strip())
+        except LangDetectException: return "unknown"
 
     @staticmethod
     def _extract_native(file_path: str) -> Optional[str]:
@@ -248,7 +260,6 @@ class ContractDocumentPipeline:
     def _ocr_image(self, img: Image.Image, page_idx: int) -> List[OCRBlock]:
         metrics = self.analyzer.analyze(img)
         logger.info(f" Page {page_idx + 1}: {metrics}")
-
         candidates = Preprocessors.get_candidates(img, metrics)
         logger.info(f" Trying {len(candidates)} strategies: {[name for name, _ in candidates]}")
 
@@ -258,13 +269,17 @@ class ContractDocumentPipeline:
 
         for name, proc_img in candidates:
             try:
-                det_results = self.detection([proc_img])
-                predictions = det_results[0]
-                bboxes = [box.bbox for box in predictions.bboxes]
-                
-                rec_results = self.recognition([proc_img], bboxes=[bboxes])[0]
-                blocks = []
+                gc.collect()
+                if torch.cuda.is_available() and os.environ.get("TORCH_DEVICE") != "cpu":
+                    torch.cuda.empty_cache()
 
+                with torch.no_grad():
+                    det_results = self.detection([proc_img])
+                    predictions = det_results[0]
+                    bboxes = [box.bbox for box in predictions.bboxes]
+                    rec_results = self.recognition([proc_img], bboxes=[bboxes])[0]
+                
+                blocks = []
                 for idx, text_line in enumerate(rec_results.text_lines):
                     text = text_line.text
                     confidence = getattr(text_line, "confidence", 1.0)
@@ -272,12 +287,8 @@ class ContractDocumentPipeline:
                     
                     if confidence >= self.min_conf:
                         blocks.append(OCRBlock(
-                            page=page_idx,
-                            text=text,
-                            confidence=confidence,
-                            language=self._detect_lang(text),
-                            bbox=bbox,
-                            strategy=name
+                            page=page_idx, text=text, confidence=confidence,
+                            language=self._detect_lang(text), bbox=bbox, strategy=name
                         ))
                 
                 score = self.scorer.score(blocks)
@@ -285,8 +296,12 @@ class ContractDocumentPipeline:
                     best_score = score
                     best_blocks = blocks
                     best_name = name
+
+                del det_results, predictions, rec_results
             except Exception as e:
                 logger.error(f"Strategy '{name}' evaluation encountered an error: {e}")
+                if torch.cuda.is_available() and os.environ.get("TORCH_DEVICE") != "cpu":
+                    torch.cuda.empty_cache()
                 
         logger.info(f" Selected strategy '{best_name}' for page {page_idx + 1} with score {best_score:.2f}")
         return best_blocks
@@ -295,28 +310,17 @@ class ContractDocumentPipeline:
         if not os.path.exists(file_path):
             raise FileNotFoundError(f"File not found: {file_path}")
 
-        # Step 1: Attempt native plain text extraction to bypass OCR entirely if possible
         native = self._extract_native(file_path)
         if native and native.strip():
-            logger.info("Native text extraction succeeded — skipping heavy OCR computation pipelines.")
-            blocks = [
-                OCRBlock(
-                    page=0, text=ln.strip(), confidence=1.0,
-                    language=self._detect_lang(ln), bbox=None,
-                    strategy="native_extraction",
-                )
-                for ln in native.splitlines() if ln.strip()
-            ]
-            if return_structured:
-                return {"source": "native_extraction", "blocks": [b.__dict__ for b in blocks]}
+            logger.info("Native text extraction succeeded — skipping heavy OCR computation.")
+            blocks = [OCRBlock(page=0, text=ln.strip(), confidence=1.0, language=self._detect_lang(ln), bbox=None, strategy="native") for ln in native.splitlines() if ln.strip()]
+            if return_structured: return {"source": "native_extraction", "blocks": [b.__dict__ for b in blocks]}
             return "\n".join(b.text for b in blocks)
 
-        # Step 2: Fall back to layout segmentation and model-based recognition strategies
         ext = os.path.splitext(file_path)[1].lower()
         all_blocks: List[OCRBlock] = []
 
         if ext == ".pdf":
-            logger.info(f"Converting scanned PDF document → image buffers at {self.dpi} DPI...")
             images = pdf2image.convert_from_path(file_path, dpi=self.dpi)
             for page_idx, img in enumerate(images):
                 all_blocks.extend(self._ocr_image(img, page_idx))
@@ -325,56 +329,57 @@ class ContractDocumentPipeline:
                 img = Image.open(file_path)
                 all_blocks.extend(self._ocr_image(img, 0))
             except Exception as e:
-                raise ValueError(f"Could not load specified file as image matrix {file_path}: {e}")
+                raise ValueError(f"Could not load image: {e}")
+
+        # ---------------------------------------------------------
+        # CRITICAL FIX: Right-To-Left (RTL) Reading Order Sorter
+        # ---------------------------------------------------------
+        valid_blocks = [b for b in all_blocks if b.bbox is not None]
+        no_box_blocks = [b for b in all_blocks if b.bbox is None]
+        
+        if valid_blocks:
+            # 1. Sort primarily Top-to-Bottom (by Y1 coordinate)
+            valid_blocks.sort(key=lambda b: b.bbox[1])
+            
+            lines = []
+            curr_line = []
+            curr_y_mid = (valid_blocks[0].bbox[1] + valid_blocks[0].bbox[3]) / 2
+            
+            for b in valid_blocks:
+                y_mid = (b.bbox[1] + b.bbox[3]) / 2
+                h = b.bbox[3] - b.bbox[1]
+                
+                # If the box is roughly on the same horizontal plane, group it into the line
+                if abs(y_mid - curr_y_mid) < (h / 1.5):
+                    curr_line.append(b)
+                else:
+                    # 2. Sort the completed line Right-to-Left (by X2 coordinate descending)
+                    curr_line.sort(key=lambda b: b.bbox[2], reverse=True)
+                    lines.extend(curr_line)
+                    curr_line = [b]
+                    curr_y_mid = y_mid
+                    
+            if curr_line:
+                curr_line.sort(key=lambda b: b.bbox[2], reverse=True)
+                lines.extend(curr_line)
+                
+            all_blocks = no_box_blocks + lines
+        # ---------------------------------------------------------
 
         if return_structured:
             return {"source": "ocr_pipeline", "blocks": [b.__dict__ for b in all_blocks]}
-        return "\n".join(b.text for b in all_blocks)
-
-        # Step 2: Fall back to layout segmentation and model-based recognition strategies
-        ext = os.path.splitext(file_path)[1].lower()
-        all_blocks: List[OCRBlock] = []
-
-        if ext == ".pdf":
-            logger.info(f"Converting scanned PDF document → image buffers at {self.dpi} DPI...")
-            images = pdf2image.convert_from_path(file_path, dpi=self.dpi)
-            for page_idx, img in enumerate(images):
-                all_blocks.extend(self._ocr_image(img, page_idx))
-        else:
-            try:
-                img = Image.open(file_path)
-                all_blocks.extend(self._ocr_image(img, 0))
-            except Exception as e:
-                raise ValueError(f"Could not load specified file as image matrix {file_path}: {e}")
-
-        if return_structured:
-            return {"source": "ocr_pipeline", "blocks": [b.__dict__ for b in all_blocks]}
-        return "\n".join(b.text for b in all_blocks)
+        return "\n".join(b.text.strip() for b in all_blocks if b.text.strip())
 
 
 _pipeline: Optional[ContractDocumentPipeline] = None
 
-
 def get_pipeline(min_confidence: float = 0.30, dpi: int = 300) -> ContractDocumentPipeline:
-    """Lazily initialize and reuse the singleton pipeline instance."""
     global _pipeline
-    if _pipeline is None:
-        _pipeline = ContractDocumentPipeline(min_confidence=min_confidence, dpi=dpi)
+    if _pipeline is None: _pipeline = ContractDocumentPipeline(min_confidence=min_confidence, dpi=dpi)
     return _pipeline
 
-
-def process_contract(
-    file_path: str,
-    return_structured: bool = False,
-    min_confidence: float = 0.30,
-    dpi: int = 300,
-) -> Union[str, dict]:
+def process_contract(file_path: str, return_structured: bool = False, min_confidence: float = 0.30, dpi: int = 300) -> Union[str, dict]:
     return get_pipeline(min_confidence, dpi).process(file_path, return_structured)
 
-
 if __name__ == "__main__":
-    # Standard runtime entry test string
-    # target_document = "sample_contract.pdf"
-    # text_output = process_contract(target_document, return_structured=False)
-    # print(text_output)
     pass
